@@ -1,0 +1,350 @@
+import tensorflow as tf
+from functools import reduce
+
+
+class Loss(object):
+  def __init__(self, model, weight=1.):
+    self._model = model
+    self._weight = weight
+
+  def __call__(self, *args, **kwargs):
+    raise NotImplementedError
+
+
+class CustomScore(Loss):
+  def __init__(self, model, weight, score_func):
+    super(CustomScore, self).__init__(model, weight)
+    self._score_func = score_func
+
+  def __call__(self):
+    return -self._weight * self._score_func
+
+
+class TvLoss(Loss):
+  def __init__(self, model, weight):
+    super(TvLoss, self).__init__(model, weight)
+
+  @staticmethod
+  def _tensor_size(tensor):
+    from operator import mul
+    return reduce(mul, (d.value for d in tensor.get_shape()), 1)
+
+  def __call__(self):  # *args, **kwargs
+    image = self._model.image_ph
+    shape = [d.value for d in image.get_shape()]
+
+    tv_y_size = self._tensor_size(image[:, 1:, :, :])
+    tv_x_size = self._tensor_size(image[:, :, 1:, :])
+    return self._weight * (
+      (tf.nn.l2_loss(image[:, 1:, :, :] - image[:, :shape[1] - 1, :, :]) /
+       tv_y_size) +
+      (tf.nn.l2_loss(image[:, :, 1:, :] - image[:, :, :shape[2] - 1, :]) /
+       tv_x_size)
+    )
+    from __future__ import print_function
+
+import tensorflow as tf
+import tensorflow.contrib.slim as slim
+import os
+import sys
+from absl import flags
+import numpy as np
+
+
+npa = np.array
+DEFAULT_IMAGE_SHAPE = (1, 299, 299, 1)
+
+
+class Model(object):
+  def __init__(self, checkpoint_path, model_name, image=None, num_classes=1001, graph=None, sess=None, gpu_options=None,
+               zoo_path='/braintree/home/bashivan/dropbox/Codes/base_model/Pipeline/Model_zoo/'):
+    if graph is None:
+      self._graph = tf.Graph()
+    else:
+      self._graph = graph
+    self._checkpoint_path = checkpoint_path
+    self._zoo_path = zoo_path
+
+    with self._graph.as_default():
+      if image is None:
+        self._image_placeholder = tf.placeholder(tf.float32, shape=DEFAULT_IMAGE_SHAPE, name='image_ph')
+      else:
+        self._image_placeholder = image
+      self._image = tf.tile(self._image_placeholder, [1, 1, 1, 3])
+      self._image_shape = [i.value for i in self._image_placeholder.shape]
+
+      self._endpoints = self._make_model(images=self._image, model_name=model_name, num_classes=num_classes)
+      if sess is None:
+        self._sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+      else:
+        self._sess = sess
+      self._initialize_all_vars()
+      self._load_checkpoint()
+
+  def _initialize_all_vars(self):
+    with self._graph.as_default():
+      init_all = tf.global_variables_initializer()
+      self._sess.run(init_all)
+
+  def _load_checkpoint(self):
+    variables_to_restore = slim.get_variables_to_restore(exclude=['input', 'pca', 'pls', 'loss', 'sep'])
+    saver = tf.train.Saver(variables_to_restore)
+    if os.path.isdir(self._checkpoint_path):
+      ckpt = tf.train.get_checkpoint_state(self._checkpoint_path)
+      if ckpt and ckpt.model_checkpoint_path:
+        if os.path.isabs(ckpt.model_checkpoint_path):
+          # Restores from checkpoint with absolute path.
+          saver.restore(self._sess, ckpt.model_checkpoint_path)
+        else:
+          # Restores from checkpoint with relative path.
+          saver.restore(self._sess, os.path.join(self._checkpoint_path,
+                                                 ckpt.model_checkpoint_path))
+
+        global_step = ckpt.model_checkpoint_path.split('/')[-1].split('-')[-1]
+        print('Succesfully loaded model from %s at step=%s.' %
+              (ckpt.model_checkpoint_path, global_step))
+      else:
+        print('No checkpoint file found')
+        return
+    else:
+      saver.restore(self._sess, self._checkpoint_path)
+
+  def inference(self, images, readout_layers):
+    endpoints = self._sess.run(self._endpoints, feed_dict={self._image_placeholder: images})
+    if type(readout_layers) is list:
+      assert all([s in endpoints for s in readout_layers]), \
+        'Layer not found. Available layers: {0}'.format(endpoints.keys())
+      return {s: endpoints[s] for s in readout_layers}
+    else:
+      assert (readout_layers in endpoints), 'Layer not found. Available layers: {0}'.format(endpoints.keys())
+      return {readout_layers: endpoints[readout_layers]}
+
+  def _make_model(self, images, model_name, num_classes=1001, is_training=False):
+    sys.path.insert(0, self._checkpoint_path)
+    sys.path.insert(0, self._zoo_path)
+    with self._graph.as_default():
+      exec('import {0}_model as model_class'.format(model_name))
+      model = eval('model_class.{0}()'.format(model_name.title()))
+      print('Model loaded.')
+
+      with slim.arg_scope(model.arg_scope()):
+        _, endpoints = model.model(
+          images,
+          num_classes=num_classes,
+          is_training=is_training,
+          scope=None)
+      return endpoints
+
+  def map_output_sep(self, weights, readout_layer):
+    with self._graph.as_default():
+      assert hasattr(self, '_endpoints')
+      num_neurons = weights['s_w'].shape[0]
+      with tf.variable_scope('sep'):
+        out_layer = self._endpoints[readout_layer]
+        preds = []
+        for n in range(num_neurons):
+          with tf.variable_scope('N_{}'.format(n)):
+            s_w = tf.Variable(
+              initial_value=weights['s_w'][n].reshape(1, out_layer.shape[1], out_layer.shape[2], 1),
+              dtype=tf.float32)
+            net = s_w * out_layer
+            d_w = tf.Variable(
+              initial_value=weights['d_w'][n].reshape(1, 1, net.shape[-1], 1),
+              dtype=tf.float32)
+            out = tf.nn.conv2d(net, d_w, [1, 1, 1, 1], 'SAME')
+            bias = tf.Variable(initial_value=weights['bias'][n], dtype=tf.float32)
+            pred = tf.reduce_sum(out, axis=[1, 2]) + bias
+            if 'hvm_neural_std' in weights:
+              pred *= tf.constant(weights['hvm_neural_std'][n], dtype=tf.float32)
+              pred += tf.constant(weights['hvm_neural_mean'][n], dtype=tf.float32)
+            preds.append(pred)
+        self._endpoints['output'] = tf.concat(preds, axis=1)
+        init_op = tf.variables_initializer(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='sep'))
+        self._sess.run(init_op)
+
+  def map_output_reg(self, weights, readout_layer):
+    with self._graph.as_default():
+      assert hasattr(self, '_endpoints')
+      with tf.variable_scope('pca'):
+        net = self._endpoints[readout_layer]
+        net = slim.flatten(net, scope='flatten')
+        net -= weights['pca_bias']
+        net = slim.fully_connected(net,
+                                   weights['pca_w'].shape[0],
+                                   activation_fn=None,
+                                   weights_initializer=tf.constant_initializer(weights['pca_w'].T,
+                                                                               verify_shape=True),
+                                   trainable=False,
+                                   scope='pca')
+        self._endpoints['pca_out'] = net
+      init_op = tf.variables_initializer(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='pca'))
+      self._sess.run(init_op)
+      with tf.variable_scope('reg'):
+        net = slim.fully_connected(net,
+                                   weights['reg_w'].shape[0],
+                                   activation_fn=None,
+                                   weights_initializer=tf.constant_initializer(weights['reg_w'].T,
+                                                                               verify_shape=True),
+                                   trainable=False,
+                                   scope='reg')
+        net += weights['reg_bias']
+        self._endpoints['output'] = net
+      init_op = tf.variables_initializer(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='reg'))
+      self._sess.run(init_op)
+
+  @property
+  def graph(self):
+    return self._graph
+
+  @property
+  def sess(self):
+    return self._sess
+
+  @property
+  def image_ph(self):
+    return self._image_placeholder
+
+  @property
+  def endpoints(self):
+    return self._endpoints
+
+
+def preprocess(im):
+  return (npa(im, dtype=np.float) - 128.) / 128.
+from __future__ import print_function
+
+import tensorflow as tf
+import numpy as np
+import copy
+
+npa = np.array
+
+
+class Synthesizer(object):
+  def __init__(self, model, losses):
+    self._graph = model.graph
+    self._sess = model.sess
+    self._image = model.image_ph
+    self._losses = losses
+    self._model = model
+
+  @staticmethod
+  def _jitter_image(img, max_pixels=19):
+    sx, sy = np.random.randint(-max_pixels, max_pixels, size=2)
+    img_shift = np.roll(np.roll(img, sx, axis=1), sy, axis=0)
+    return img_shift, sx, sy
+
+  @staticmethod
+  def _unjitter_image(img, sx, sy):
+    return np.roll(np.roll(img, -sx, axis=1), -sy, axis=0)
+
+  @staticmethod
+  def _postprocess(image):
+    image = copy.copy(image) * 128.
+    image = (image * 0.99 + 128.).astype(np.uint8)
+    return image
+
+  def run(self, num_iterations, initial_image, jitter=False, learning_rate=0.001,
+          chkpt_period=100, monitor_varaible=None):
+    with self._graph.as_default():
+      run_feed_dict = {self._image: initial_image}
+      img = initial_image.copy()
+      with tf.variable_scope('loss'):
+        total_loss = tf.reduce_sum([loss() for loss in self._losses])
+        grads = tf.gradients(total_loss, self._image)[0]
+        g_bias, g_var = tf.nn.moments(tf.reshape(grads, [-1]), axes=[0])
+        grads /= tf.sqrt(g_var) + 1e-8
+
+      init_loss = tf.variables_initializer(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='loss'))
+      self._sess.run(init_loss)
+      outputs, features_cache, chkpoints = [], [], []
+      for i in range(num_iterations):
+        if jitter:
+          sub, sx, sy = self._jitter_image(img)
+          run_feed_dict.update({self._image: sub})
+          gs = self._sess.run(grads, feed_dict=run_feed_dict)
+          gs = self._unjitter_image(gs, sx, sy)
+        else:
+          gs = self._sess.run(grads, feed_dict=run_feed_dict)
+        img = np.clip(img - gs * learning_rate, -1, 1)
+        run_feed_dict.update({self._image: img})
+
+        if (i % chkpt_period == 0) or (i == num_iterations - 1):
+          print('Scores: {0}, Saving checkpoint - {1}'.format(total_loss.eval(feed_dict=run_feed_dict), i))
+          features_cache.append(self._losses[0]().eval(feed_dict=run_feed_dict))
+          chkpoints.append(self._postprocess(img))
+          if monitor_varaible is not None:
+            outputs.append(self._model.endpoints[monitor_varaible].eval(feed_dict=run_feed_dict))
+
+      return features_cache, chkpoints, outputs
+
+
+def main():
+  import h5py
+  import tensorflow as tf
+  import numpy as np
+  from npc.model import Model
+  # import npc.synthesizer as synthesizer
+  import npc.losses as losses
+  import matplotlib.pyplot as plt
+
+  npa = np.array
+
+  neuron_id = 45
+  mode = 'ohp'  # ['stretch', 'ohp']
+  assert mode in ['stretch', 'ohp']
+
+  with h5py.File(
+    '/braintree/data2/active/users/bashivan/results/dimensionality/synth_images/v4_sep_weights_magneto_retina_season9.h5') \
+    as h5file:
+    weights = {k: npa(h5file[k]) for k in h5file.keys()}
+
+  checkpoint_path = '/braintree/data2/active/users/bashivan/checkpoints/imagenet_alexnet_raw_/'
+  readout_layer = 'conv3'
+  output_layer = 'output'
+  ph_shape = (1, 299, 299, 1)
+
+  gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.25)
+
+  with tf.Graph().as_default() as g, tf.Session() as sess:
+    np.random.seed(0)
+    initial_image = np.random.uniform(low=-1, high=1, size=ph_shape)
+    initial_image /= 2 * np.max(np.abs(initial_image))
+
+    image_ph = tf.placeholder(tf.float32, shape=ph_shape, name='image_ph')
+    model = Model(checkpoint_path=checkpoint_path, model_name='alexnet', image=image_ph,
+                  graph=g, sess=sess, gpu_options=gpu_options)
+    model.map_output_sep(weights=weights, readout_layer=readout_layer)
+
+    # Construct the score function using TF functions
+    if mode == 'stretch':
+      score_func = tf.reshape(model.endpoints[output_layer], (-1,))[neuron_id]
+    else:
+      score_func = tf.reshape(tf.nn.softmax(model.endpoints[output_layer], axis=-1), (-1,))[neuron_id]
+
+    ls = [losses.CustomScore(model, weight=1.0, score_func=score_func),
+          losses.TvLoss(model, weight=500.0)]
+    synth = Synthesizer(model=model, losses=ls)
+    preds, checkpoints, outputs = synth.run(num_iterations=200, initial_image=initial_image,
+                                            jitter=True, monitor_varaible=output_layer, learning_rate=0.01)
+    print(np.squeeze(outputs)[:, neuron_id])
+    plt.figure()
+    plt.imshow(np.squeeze(checkpoints[-1]), cmap='gray')
+    plt.axis('off')
+    plt.show()
+
+
+if __name__ == '__main__':
+  main()
+  from distutils.core import setup
+
+setup(
+    name='NeuralPopulationControl',
+    version='0.1',
+    packages=['npc'],
+    install_requires=['numpy', 'scipy', 'h5py', 'tensorflow-gpu', 'absl-py', 'pillow'],
+    url='https://github.com/dicarlolab/npc.git',
+    license='MIT License',
+    author='Pouya Bashivan',
+    description="Stimulus generator for neural population control."
+)
